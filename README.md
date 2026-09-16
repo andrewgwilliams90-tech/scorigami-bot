@@ -1,48 +1,48 @@
 # Scorigami → Discord bot
 
-Watches a Bluesky account (the Scorigami tracker) and posts any new post to a
-Discord channel via webhook. Runs for free on GitHub Actions — no server,
-no Yahoo/X credentials, nothing to keep running on your own machine.
+Checks real NFL game results and posts to a Discord channel the moment a
+final score happens that's **never occurred before in NFL history** — a
+"Scorigami." Runs for free on GitHub Actions, no server, no social media
+accounts to depend on.
 
-## Setup (10 minutes, no coding required)
+## How it works
 
-1. **Create a GitHub account** if you don't have one (free) — github.com.
+Instead of relying on a Twitter/X or Bluesky bot (both turned out to be
+unreliable), this pulls directly from a free, actively-maintained public
+dataset of every NFL game since 1999, which updates itself shortly after
+each game ends. Every 15 minutes it checks for newly finished games and
+compares each final score against all NFL history. If a score has never
+happened before, it posts an alert.
 
-2. **Create a new repository** and upload these files to it (drag-and-drop
-   works fine on github.com, or use "Add file → Upload files").
+## Setup (5 minutes, no coding required)
 
-3. **Find the Bluesky handle** for the Scorigami tracker: open the Bluesky
-   app or bsky.app, search "Scorigami", and copy the handle from their
-   profile URL (it'll look like `bsky.app/profile/<handle>`). Use just the
-   handle part, not the full URL.
-
-4. **Create a Discord webhook** for your target channel:
+1. **Create a Discord webhook** for your target channel:
    - In Discord, go to the channel → Edit Channel → Integrations → Webhooks
      → New Webhook
    - Name it (e.g. "Scorigami") and copy the Webhook URL
 
-5. **Add two secrets to your GitHub repo:**
+2. **Add it as a secret in this repo:**
    - Go to your repo → Settings → Secrets and variables → Actions →
      New repository secret
-   - Add `BSKY_HANDLE` = the handle from step 3
-   - Add `DISCORD_WEBHOOK_URL` = the URL from step 4
+   - Name: `DISCORD_WEBHOOK_URL`
+   - Value: paste the webhook URL
 
-6. **Turn on Actions:** go to the "Actions" tab in your repo and enable
-   workflows if prompted. The bot will now run automatically every 15
-   minutes.
+3. **Turn on Actions:** go to the "Actions" tab and enable workflows if
+   prompted.
 
-7. **Test it:** go to Actions → "Check Scorigami" → "Run workflow" to
-   trigger it manually and confirm it runs without errors. The very first
-   run just sets a baseline (it won't post anything old) — every run after
-   that will post new items as they appear.
+4. **Test it:** Actions → "Check Scorigami" → "Run workflow" to trigger it
+   manually. The first-ever run just sets a baseline (won't post anything
+   old) — every run after that checks for new scorigamis.
 
 ## Notes
 
-- This is a **public** Bluesky feed — no login or API key needed to read it.
+- By default it only posts when a **scorigami** happens. If you'd rather
+  see every finished game reported (scorigami or not), open
+  `scorigami_bot.py` and change `POST_EVERY_GAME = False` to `True`.
+- No API keys, logins, or third-party accounts required — the data source
+  is a public file, no auth needed.
 - If your repo is private, GitHub Actions has a free monthly minutes quota
-  (2,000 min/month on free plans) — running every 15 min comfortably fits
-  within that. If you want to be extra safe, make the repo public (Actions
-  are unlimited for public repos) or narrow the cron schedule to Sundays
-  during football season.
-- If Discord ever shows nothing posting, check the Actions tab for a failed
-  run — it'll show you the error (usually a missing/mistyped secret).
+  (2,000 min/month) — running every 15 min comfortably fits within that.
+  Public repos have unlimited Action minutes.
+- If nothing posts, check the Actions tab for a failed run — it'll show
+  the error (usually a missing/mistyped secret).

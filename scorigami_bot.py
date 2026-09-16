@@ -1,18 +1,24 @@
 """
-Scorigami -> Discord bridge.
+Scorigami checker -> Discord bridge.
 
-Polls a Bluesky account's public post feed (no auth required) and forwards
-any new posts to a Discord channel via webhook.
+Computes Scorigami directly from real NFL game data instead of depending on
+any third-party bot or social account. Data source: the nflverse project's
+public, auto-updated "schedules" dataset, which has the final score of
+every NFL game back to 1999 and refreshes shortly after each game ends.
+No API key or login needed to read it.
 
-Required environment variables:
-  BSKY_HANDLE          e.g. "scorigami.bsky.social" (no @, no https://)
+Required environment variable:
   DISCORD_WEBHOOK_URL  Discord channel webhook URL
 
-State is kept in state.json (the last post URI we've already sent) so the
-same post never gets forwarded twice. The GitHub Actions workflow commits
-this file back to the repo after every run.
+State is kept in state.json (the most recent game date we've already
+checked, plus which game IDs on that date we've handled) so the same game
+never gets reported twice even if a Sunday slate finishes across multiple
+runs. The GitHub Actions workflow commits this file back to the repo after
+every run.
 """
 
+import csv
+import io
 import json
 import os
 import sys
@@ -21,95 +27,115 @@ from pathlib import Path
 import requests
 
 STATE_FILE = Path(__file__).parent / "state.json"
-BSKY_FEED_URL = "https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed"
+GAMES_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv"
+
+# Set to True if you want every finished game reported, not just scorigamis.
+POST_EVERY_GAME = False
 
 
 def load_state() -> dict:
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
-    return {"last_uri": None}
+    return {"last_date": None, "last_date_game_ids": []}
 
 
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def fetch_recent_posts(handle: str, limit: int = 10) -> list[dict]:
-    resp = requests.get(
-        BSKY_FEED_URL,
-        params={"actor": handle, "limit": limit},
-        timeout=15,
-    )
+def fetch_games() -> list[dict]:
+    resp = requests.get(GAMES_CSV_URL, timeout=30)
     resp.raise_for_status()
-    return resp.json().get("feed", [])
+    reader = csv.DictReader(io.StringIO(resp.text))
+    return list(reader)
 
 
-def post_uri_to_web_url(handle: str, uri: str) -> str:
-    # uri looks like: at://did:plc:xxxx/app.bsky.feed.post/<rkey>
-    rkey = uri.rstrip("/").split("/")[-1]
-    return f"https://bsky.app/profile/{handle}/post/{rkey}"
+def score_key(score_a: int, score_b: int) -> tuple:
+    # Order-independent so 24-17 and 17-24 count as the same combination.
+    return tuple(sorted((score_a, score_b)))
 
 
-def send_to_discord(webhook_url: str, text: str, link: str) -> None:
-    payload = {
-        "username": "Scorigami",
-        "embeds": [
-            {
-                "description": text[:4000],
-                "url": link,
-                "color": 0x00A8E8,
-            }
-        ],
-    }
-    resp = requests.post(webhook_url, json=payload, timeout=15)
+def send_to_discord(webhook_url: str, message: str) -> None:
+    resp = requests.post(webhook_url, json={"content": message}, timeout=15)
     resp.raise_for_status()
 
 
 def main() -> None:
-    handle = os.environ.get("BSKY_HANDLE")
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
-
-    if not handle or not webhook_url:
-        print("Missing BSKY_HANDLE or DISCORD_WEBHOOK_URL env vars.", file=sys.stderr)
+    if not webhook_url:
+        print("Missing DISCORD_WEBHOOK_URL env var.", file=sys.stderr)
         sys.exit(1)
 
     state = load_state()
-    last_uri = state.get("last_uri")
+    last_date = state.get("last_date")
+    last_date_game_ids = set(state.get("last_date_game_ids", []))
 
-    feed = fetch_recent_posts(handle)
-    if not feed:
-        print("No posts returned from Bluesky.")
-        return
+    games = fetch_games()
 
-    # feed[0] is the newest post. Walk until we hit the last one we've seen.
-    new_items = []
-    for item in feed:
-        uri = item["post"]["uri"]
-        if uri == last_uri:
-            break
-        new_items.append(item)
+    # Only games that have actually finished (have a score) count as history.
+    completed = [g for g in games if g["home_score"] not in ("", None)]
+    completed.sort(key=lambda g: (g["gameday"], g["game_id"]))
 
-    if last_uri is None:
-        # First-ever run: don't spam the channel with backlog, just
-        # record the current newest post as the baseline.
-        state["last_uri"] = feed[0]["post"]["uri"]
-        save_state(state)
+    if last_date is None:
+        # First-ever run: set today's data as the baseline so we don't
+        # dump 25+ years of scorigami history into the channel at once.
+        if completed:
+            newest_date = completed[-1]["gameday"]
+            ids_on_newest_date = {g["game_id"] for g in completed if g["gameday"] == newest_date}
+            state["last_date"] = newest_date
+            state["last_date_game_ids"] = sorted(ids_on_newest_date)
+            save_state(state)
         print("First run: baseline set, no messages sent.")
         return
 
-    if not new_items:
-        print("No new posts.")
+    # Walk history in order, tracking how many times each score combo has
+    # occurred so far, so we can tell whether a NEW game is a first-ever score.
+    seen_counts: dict = {}
+    newly_finished = []
+
+    for game in completed:
+        gameday = game["gameday"]
+        is_new = (gameday > last_date) or (
+            gameday == last_date and game["game_id"] not in last_date_game_ids
+        )
+
+        key = score_key(int(float(game["home_score"])), int(float(game["away_score"])))
+        seen_counts[key] = seen_counts.get(key, 0) + 1
+
+        if is_new:
+            newly_finished.append((game, seen_counts[key]))
+
+    if not newly_finished:
+        print("No newly finished games.")
         return
 
-    # Post oldest-first so the channel reads in chronological order.
-    for item in reversed(new_items):
-        post = item["post"]
-        text = post["record"].get("text", "")
-        link = post_uri_to_web_url(handle, post["uri"])
-        send_to_discord(webhook_url, text, link)
-        print(f"Posted: {text[:60]!r}")
+    for game, occurrences in newly_finished:
+        home, home_score, away, away_score = (
+            game["home_team"], game["home_score"], game["away_team"], game["away_score"]
+        )
 
-    state["last_uri"] = feed[0]["post"]["uri"]
+        if occurrences == 1:
+            message = (
+                f"🚨 **SCORIGAMI!** 🚨\n"
+                f"{away} {away_score} — {home} {home_score} ({game['gameday']})\n"
+                f"This is the first time in NFL history this score has happened."
+            )
+            send_to_discord(webhook_url, message)
+            print(f"Posted SCORIGAMI: {away} {away_score} - {home} {home_score}")
+        elif POST_EVERY_GAME:
+            message = (
+                f"{away} {away_score} — {home} {home_score} ({game['gameday']})\n"
+                f"No scorigami — this score has now happened {occurrences} times."
+            )
+            send_to_discord(webhook_url, message)
+            print(f"Posted (non-scorigami): {away} {away_score} - {home} {home_score}")
+        else:
+            print(f"Checked, not a scorigami ({occurrences}x): {away} {away_score} - {home} {home_score}")
+
+    newest_date = completed[-1]["gameday"]
+    ids_on_newest_date = {g["game_id"] for g in completed if g["gameday"] == newest_date}
+    state["last_date"] = newest_date
+    state["last_date_game_ids"] = sorted(ids_on_newest_date)
     save_state(state)
 
 
