@@ -1,11 +1,17 @@
 """
 Scorigami checker -> Discord bridge.
 
-Computes Scorigami directly from real NFL game data instead of depending on
-any third-party bot or social account. Data source: the nflverse project's
-public, auto-updated "schedules" dataset, which has the final score of
-every NFL game back to 1999 and refreshes shortly after each game ends.
-No API key or login needed to read it.
+Two data sources:
+1. nflverse's public "schedules" dataset -> tells us which games just
+   finished (reliable, versioned, built for programmatic access).
+2. The official nflscorigami.com site's own data endpoint -> gives us the
+   REAL historical count and "first ever happened on" date for every score
+   combination, going back to 1920 (same source the official site itself
+   uses), so our scorigami count matches theirs.
+
+Source #2 is an unofficial/undocumented endpoint (just what their website
+happens to call), so if it's ever unreachable, the bot falls back to
+reporting scores without the official tally rather than failing outright.
 
 Required environment variable:
   DISCORD_WEBHOOK_URL  Discord channel webhook URL
@@ -28,8 +34,8 @@ from pathlib import Path
 import requests
 
 STATE_FILE = Path(__file__).parent / "state.json"
-# nflverse switched this file to gzip-compressed at some point; .csv.gz is current.
 GAMES_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv.gz"
+OFFICIAL_DATA_URL = "https://nflscorigami.com/data"
 
 # Set to True if you want every finished game reported, not just scorigamis.
 POST_EVERY_GAME = True
@@ -53,8 +59,44 @@ def fetch_games() -> list[dict]:
     return list(reader)
 
 
+def fetch_official_matrix() -> dict | None:
+    """Returns the official site's matrix, or None if it's unreachable."""
+    try:
+        resp = requests.get(OFFICIAL_DATA_URL, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("matrix")
+    except Exception as e:
+        print(f"Warning: couldn't reach official scorigami data ({e}). "
+              f"Falling back to plain score reporting.", file=sys.stderr)
+        return None
+
+
+def lookup_official(matrix: dict | None, loser_score: int, winner_score: int) -> dict | None:
+    """Matrix is indexed [loser_score][winner_score] -> {count, first_date, last_date}."""
+    if matrix is None:
+        return None
+    row = matrix.get(str(loser_score))
+    if not row:
+        return None
+    return row.get(str(winner_score))
+
+
+def official_rank(matrix: dict, as_of_date: str) -> int:
+    """How many unique scores had their first-ever occurrence on or before
+    as_of_date. Used to say 'this is the Nth unique score in NFL history.'
+    Ties on the exact same date are counted together (can't sub-order ties
+    from this data), so this is a close approximation, not a guarantee of
+    the website's literal running order within a single day."""
+    first_dates = []
+    for row in matrix.values():
+        for cell in row.values():
+            if cell.get("count", 0) > 0:
+                first_dates.append(cell["first_date"][:10])
+    return sum(1 for d in first_dates if d <= as_of_date)
+
+
 def score_key(score_a: int, score_b: int) -> tuple:
-    # Order-independent so 24-17 and 17-24 count as the same combination.
     return tuple(sorted((score_a, score_b)))
 
 
@@ -74,14 +116,12 @@ def main() -> None:
     last_date_game_ids = set(state.get("last_date_game_ids", []))
 
     games = fetch_games()
+    official_matrix = fetch_official_matrix()
 
-    # Only games that have actually finished (have a score) count as history.
     completed = [g for g in games if g["home_score"] not in ("", None)]
     completed.sort(key=lambda g: (g["gameday"], g["game_id"]))
 
     if last_date is None:
-        # First-ever run: set today's data as the baseline so we don't
-        # dump 25+ years of scorigami history into the channel at once.
         if completed:
             newest_date = completed[-1]["gameday"]
             ids_on_newest_date = {g["game_id"] for g in completed if g["gameday"] == newest_date}
@@ -91,49 +131,68 @@ def main() -> None:
         print("First run: baseline set, no messages sent.")
         return
 
-    # Walk history in order, tracking how many times each score combo has
-    # occurred so far, so we can tell whether a NEW game is a first-ever score.
-    seen_counts: dict = {}
+    # Always compute our own backup counts from nflverse (reliable, but only
+    # goes back to 1999), in case the official site is unreachable this run.
+    backup_counts: dict = {}
     newly_finished = []
-
     for game in completed:
+        key = score_key(int(float(game["home_score"])), int(float(game["away_score"])))
+        backup_counts[key] = backup_counts.get(key, 0) + 1
+
         gameday = game["gameday"]
         is_new = (gameday > last_date) or (
             gameday == last_date and game["game_id"] not in last_date_game_ids
         )
-
-        key = score_key(int(float(game["home_score"])), int(float(game["away_score"])))
-        seen_counts[key] = seen_counts.get(key, 0) + 1
-
         if is_new:
-            newly_finished.append((game, seen_counts[key]))
+            newly_finished.append((game, backup_counts[key]))
 
     if not newly_finished:
         print("No newly finished games.")
         return
 
-    for game, occurrences in newly_finished:
+    for game, backup_count in newly_finished:
         home, home_score, away, away_score = (
-            game["home_team"], game["home_score"], game["away_team"], game["away_score"]
+            game["home_team"], int(float(game["home_score"])),
+            game["away_team"], int(float(game["away_score"])),
         )
+        winner_score, loser_score = max(home_score, away_score), min(home_score, away_score)
+        gameday = game["gameday"]
 
-        if occurrences == 1:
+        official = lookup_official(official_matrix, loser_score, winner_score)
+
+        if official_matrix is not None:
+            # Trust the official site when we successfully reached it.
+            is_scorigami = official is None or official.get("count", 0) == 0
+            count = official["count"] if official else 0
+            source_note = ""
+        else:
+            # Official site unreachable this run - fall back to our own
+            # count since 1999 so we don't falsely call everything new.
+            is_scorigami = backup_count == 1
+            count = backup_count
+            source_note = " (backup count since 1999 — official site was unreachable this run)"
+
+        if is_scorigami:
+            rank_note = ""
+            if official_matrix is not None:
+                rank = official_rank(official_matrix, gameday)
+                rank_note = f" This is the **{rank}th unique score** in NFL history."
             message = (
                 f"🚨 **SCORIGAMI!** 🚨\n"
-                f"{away} {away_score} — {home} {home_score} ({game['gameday']})\n"
-                f"This is the first time in NFL history this score has happened."
+                f"{away} {away_score} — {home} {home_score} ({gameday})\n"
+                f"This is the first time this score has ever happened.{rank_note}{source_note}"
             )
             send_to_discord(webhook_url, message)
             print(f"Posted SCORIGAMI: {away} {away_score} - {home} {home_score}")
         elif POST_EVERY_GAME:
             message = (
-                f"{away} {away_score} — {home} {home_score} ({game['gameday']})\n"
-                f"No scorigami — this score has now happened {occurrences} times."
+                f"{away} {away_score} — {home} {home_score} ({gameday})\n"
+                f"No scorigami — this score has now happened {count} times.{source_note}"
             )
             send_to_discord(webhook_url, message)
             print(f"Posted (non-scorigami): {away} {away_score} - {home} {home_score}")
         else:
-            print(f"Checked, not a scorigami ({occurrences}x): {away} {away_score} - {home} {home_score}")
+            print(f"Checked, not a scorigami: {away} {away_score} - {home} {home_score}")
 
     newest_date = completed[-1]["gameday"]
     ids_on_newest_date = {g["game_id"] for g in completed if g["gameday"] == newest_date}
