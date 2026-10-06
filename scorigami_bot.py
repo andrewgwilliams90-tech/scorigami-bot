@@ -32,7 +32,7 @@ STATE_FILE = Path(__file__).parent / "state.json"
 GAMES_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv.gz"
 
 # Set to True if you want every finished game reported, not just scorigamis.
-POST_EVERY_GAME = False
+POST_EVERY_GAME = True
 
 
 def load_state() -> dict:
