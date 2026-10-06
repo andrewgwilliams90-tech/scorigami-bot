@@ -18,6 +18,7 @@ every run.
 """
 
 import csv
+import gzip
 import io
 import json
 import os
@@ -27,7 +28,8 @@ from pathlib import Path
 import requests
 
 STATE_FILE = Path(__file__).parent / "state.json"
-GAMES_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv"
+# nflverse switched this file to gzip-compressed at some point; .csv.gz is current.
+GAMES_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv.gz"
 
 # Set to True if you want every finished game reported, not just scorigamis.
 POST_EVERY_GAME = False
@@ -46,7 +48,8 @@ def save_state(state: dict) -> None:
 def fetch_games() -> list[dict]:
     resp = requests.get(GAMES_CSV_URL, timeout=30)
     resp.raise_for_status()
-    reader = csv.DictReader(io.StringIO(resp.text))
+    text = gzip.decompress(resp.content).decode("utf-8")
+    reader = csv.DictReader(io.StringIO(text))
     return list(reader)
 
 
