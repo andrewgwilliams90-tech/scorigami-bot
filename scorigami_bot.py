@@ -59,7 +59,7 @@ def fetch_games() -> list[dict]:
     return list(reader)
 
 
-def fetch_official_matrix() -> dict | None:
+def fetch_official_matrix():
     """Returns the official site's matrix, or None if it's unreachable."""
     try:
         resp = requests.get(OFFICIAL_DATA_URL, timeout=20)
@@ -72,28 +72,45 @@ def fetch_official_matrix() -> dict | None:
         return None
 
 
-def lookup_official(matrix: dict | None, loser_score: int, winner_score: int) -> dict | None:
-    """Matrix is indexed [loser_score][winner_score] -> {count, first_date, last_date}."""
+def _cell(matrix, loser_score: int, winner_score: int):
+    """Safely get matrix[loser][winner]. Works whether the official data
+    arrives as lists (what it actually is) or as dicts keyed by score."""
+    try:
+        row = matrix[loser_score] if isinstance(matrix, list) else matrix.get(str(loser_score))
+        if not row:
+            return None
+        cell = row[winner_score] if isinstance(row, list) else row.get(str(winner_score))
+        return cell if cell else None
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def lookup_official(matrix, loser_score: int, winner_score: int) -> dict | None:
+    """Official matrix is indexed [loser_score][winner_score] -> {count, first_date, last_date}."""
     if matrix is None:
         return None
-    row = matrix.get(str(loser_score))
-    if not row:
-        return None
-    return row.get(str(winner_score))
+    return _cell(matrix, loser_score, winner_score)
 
 
-def official_rank(matrix: dict, as_of_date: str) -> int:
+def _all_cells(matrix):
+    rows = matrix if isinstance(matrix, list) else list(matrix.values())
+    for row in rows:
+        if not row:
+            continue
+        cells = row if isinstance(row, list) else list(row.values())
+        for cell in cells:
+            if cell and cell.get("count", 0) > 0:
+                yield cell
+
+
+def official_rank(matrix, as_of_date: str, already_counted: bool) -> int:
     """How many unique scores had their first-ever occurrence on or before
-    as_of_date. Used to say 'this is the Nth unique score in NFL history.'
-    Ties on the exact same date are counted together (can't sub-order ties
-    from this data), so this is a close approximation, not a guarantee of
-    the website's literal running order within a single day."""
-    first_dates = []
-    for row in matrix.values():
-        for cell in row.values():
-            if cell.get("count", 0) > 0:
-                first_dates.append(cell["first_date"][:10])
-    return sum(1 for d in first_dates if d <= as_of_date)
+    as_of_date, i.e. 'this is the Nth unique score in NFL history.'
+    If the official site hasn't added today's game yet, we add 1 for it.
+    Ties on the exact same date are counted together, so this is a close
+    approximation of the website's running order within a single day."""
+    n = sum(1 for c in _all_cells(matrix) if str(c.get("first_date", ""))[:10] <= as_of_date)
+    return n if already_counted else n + 1
 
 
 def score_key(score_a: int, score_b: int) -> tuple:
@@ -162,7 +179,11 @@ def main() -> None:
 
         if official_matrix is not None:
             # Trust the official site when we successfully reached it.
-            is_scorigami = official is None or official.get("count", 0) == 0
+            already_counted = bool(
+                official and official.get("count", 0) == 1
+                and str(official.get("first_date", ""))[:10] == gameday
+            )
+            is_scorigami = official is None or official.get("count", 0) == 0 or already_counted
             count = official["count"] if official else 0
             source_note = ""
         else:
@@ -175,7 +196,7 @@ def main() -> None:
         if is_scorigami:
             rank_note = ""
             if official_matrix is not None:
-                rank = official_rank(official_matrix, gameday)
+                rank = official_rank(official_matrix, gameday, already_counted)
                 rank_note = f" This is the **{rank}th unique score** in NFL history."
             message = (
                 f"🚨 **SCORIGAMI!** 🚨\n"
