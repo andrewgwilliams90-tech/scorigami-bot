@@ -38,7 +38,7 @@ GAMES_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/sch
 OFFICIAL_DATA_URL = "https://nflscorigami.com/data"
 
 # Set to True if you want every finished game reported, not just scorigamis.
-POST_EVERY_GAME = True
+POST_EVERY_GAME = False
 
 
 def load_state() -> dict:
