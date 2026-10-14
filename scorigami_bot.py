@@ -29,6 +29,7 @@ import io
 import json
 import os
 import sys
+from datetime import date
 from pathlib import Path
 
 import requests
@@ -39,6 +40,12 @@ OFFICIAL_DATA_URL = "https://nflscorigami.com/data"
 
 # Set to True if you want every finished game reported, not just scorigamis.
 POST_EVERY_GAME = False
+
+# "Fun find" alerts: even when POST_EVERY_GAME is False, also post a game
+# that isn't a scorigami but has a rare score. Set either number to 0 to
+# turn that rule off.
+RARE_SCORE_MAX_COUNT = 10   # post if this game makes it the Nth time or fewer (counting this game)
+DROUGHT_YEARS = 10          # post if this score hadn't happened in this many years or more
 
 
 def load_state() -> dict:
@@ -113,6 +120,14 @@ def official_rank(matrix, as_of_date: str, already_counted: bool) -> int:
     return n if already_counted else n + 1
 
 
+def ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
 def score_key(score_a: int, score_b: int) -> tuple:
     return tuple(sorted((score_a, score_b)))
 
@@ -151,23 +166,26 @@ def main() -> None:
     # Always compute our own backup counts from nflverse (reliable, but only
     # goes back to 1999), in case the official site is unreachable this run.
     backup_counts: dict = {}
+    last_seen: dict = {}
     newly_finished = []
     for game in completed:
         key = score_key(int(float(game["home_score"])), int(float(game["away_score"])))
         backup_counts[key] = backup_counts.get(key, 0) + 1
+        previous_date = last_seen.get(key)  # None = not seen since 1999 (start of our data)
+        last_seen[key] = game["gameday"]
 
         gameday = game["gameday"]
         is_new = (gameday > last_date) or (
             gameday == last_date and game["game_id"] not in last_date_game_ids
         )
         if is_new:
-            newly_finished.append((game, backup_counts[key]))
+            newly_finished.append((game, backup_counts[key], previous_date))
 
     if not newly_finished:
         print("No newly finished games.")
         return
 
-    for game, backup_count in newly_finished:
+    for game, backup_count, previous_date in newly_finished:
         home, home_score, away, away_score = (
             game["home_team"], int(float(game["home_score"])),
             game["away_team"], int(float(game["away_score"])),
@@ -185,6 +203,15 @@ def main() -> None:
             )
             is_scorigami = official is None or official.get("count", 0) == 0 or already_counted
             count = official["count"] if official else 0
+            if official and not already_counted:
+                # Make sure the count includes the game that just finished.
+                # If the official site's "last happened" date is before this
+                # game, it hasn't added this game yet, so add it ourselves.
+                try:
+                    if date.fromisoformat(str(official.get("last_date", ""))[:10]) < date.fromisoformat(gameday):
+                        count += 1
+                except ValueError:
+                    pass  # can't read their date, so trust their number as-is
             source_note = ""
         else:
             # Official site unreachable this run - fall back to our own
@@ -197,7 +224,7 @@ def main() -> None:
             rank_note = ""
             if official_matrix is not None:
                 rank = official_rank(official_matrix, gameday, already_counted)
-                rank_note = f" This is the **{rank}th unique score** in NFL history."
+                rank_note = f" This is the **{ordinal(rank)} unique score** in NFL history."
             message = (
                 f"🚨 **SCORIGAMI!** 🚨\n"
                 f"{away} {away_score} — {home} {home_score} ({gameday})\n"
@@ -205,15 +232,40 @@ def main() -> None:
             )
             send_to_discord(webhook_url, message)
             print(f"Posted SCORIGAMI: {away} {away_score} - {home} {home_score}")
-        elif POST_EVERY_GAME:
-            message = (
-                f"{away} {away_score} — {home} {home_score} ({gameday})\n"
-                f"No scorigami — this score has now happened {count} times.{source_note}"
-            )
-            send_to_discord(webhook_url, message)
-            print(f"Posted (non-scorigami): {away} {away_score} - {home} {home_score}")
         else:
-            print(f"Checked, not a scorigami: {away} {away_score} - {home} {home_score}")
+            # Not a scorigami - check the "fun find" rules.
+            reasons = []
+            if RARE_SCORE_MAX_COUNT and count <= RARE_SCORE_MAX_COUNT:
+                reasons.append(f"This is only the {ordinal(count)} time this score has happened in NFL history.")
+            if DROUGHT_YEARS:
+                game_day = date.fromisoformat(gameday)
+                if previous_date is None:
+                    # Not seen at all since 1999, so at least this long a gap.
+                    gap_years = (game_day - date(1999, 9, 1)).days / 365.25
+                    if gap_years >= DROUGHT_YEARS:
+                        reasons.append("First time this score has happened since before 1999.")
+                else:
+                    gap_years = (game_day - date.fromisoformat(previous_date)).days / 365.25
+                    if gap_years >= DROUGHT_YEARS:
+                        reasons.append(f"This score hadn't happened since {previous_date[:4]}.")
+
+            if reasons:
+                message = (
+                    f"🍆 **Rare score alert** (not a scorigami, but still special)\n"
+                    f"{away} {away_score} — {home} {home_score} ({gameday})\n"
+                    + " ".join(reasons) + source_note
+                )
+                send_to_discord(webhook_url, message)
+                print(f"Posted rare score: {away} {away_score} - {home} {home_score}")
+            elif POST_EVERY_GAME:
+                message = (
+                    f"{away} {away_score} — {home} {home_score} ({gameday})\n"
+                    f"No scorigami — this score has now happened {count} times.{source_note}"
+                )
+                send_to_discord(webhook_url, message)
+                print(f"Posted (non-scorigami): {away} {away_score} - {home} {home_score}")
+            else:
+                print(f"Checked, not a scorigami: {away} {away_score} - {home} {home_score}")
 
     newest_date = completed[-1]["gameday"]
     ids_on_newest_date = {g["game_id"] for g in completed if g["gameday"] == newest_date}
